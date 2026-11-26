@@ -1209,6 +1209,15 @@ in_scrubprefix(struct in_ifaddr *target, u_int flags)
 			continue;
 
 		/*
+		 * A CARP BACKUP/INIT address is configured on the interface but
+		 * is not a forwarding owner.  Do not hand a departing ordinary
+		 * address's prefix route to a standby CARP identity.
+		 */
+		if (ia->ia_ifa.ifa_carp != NULL &&
+		    (carp_master_p == NULL || !carp_master_p(&ia->ia_ifa)))
+			continue;
+
+		/*
 		 * If we got a matching prefix address, move IFA_ROUTE and
 		 * the route itself to it.  Make sure that routing daemons
 		 * get a heads-up.
@@ -1216,6 +1225,16 @@ in_scrubprefix(struct in_ifaddr *target, u_int flags)
 		if ((ia->ia_flags & IFA_ROUTE) == 0) {
 			ifa_ref(&ia->ia_ifa);
 			NET_EPOCH_EXIT(et);
+			/*
+			 * A CARP state change uses RTM_NEWADDR/RTM_DELADDR as
+			 * forwarding-ownership notifications while the address stays
+			 * configured.  The ordinary transfer path below only changes
+			 * the prefix route, so explicitly withdraw the old CARP owner
+			 * before handing that prefix to another forwarding address.
+			 */
+			if (target->ia_ifa.ifa_carp != NULL)
+				rt_addrmsg(RTM_DELETE, &target->ia_ifa,
+				    target->ia_ifp->if_fib);
 			error = in_handle_ifaddr_route(RTM_DELETE, target);
 			if (error == 0)
 				target->ia_flags &= ~IFA_ROUTE;
@@ -1390,6 +1409,15 @@ in_ifnet_event(void *arg __unused, struct ifnet *ifp, int event)
 				continue;
 			ia = (struct in_ifaddr *)ifa;
 			if (ia->ia_flags & IFA_ROUTE)
+				continue;
+			/*
+			 * A configured CARP address is not a local route owner while
+			 * its VHID is BACKUP/INIT.  carp(4) will install the route
+			 * when the VHID becomes MASTER.  Recreating it merely because
+			 * the parent interface came back up violates that ownership.
+			 */
+			if (ifa->ifa_carp != NULL &&
+			    (carp_master_p == NULL || !carp_master_p(ifa)))
 				continue;
 			ifa_ref(ifa);
 			error = ifa_del_loopback_route(ifa, ifa->ifa_addr);

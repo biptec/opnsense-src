@@ -217,6 +217,109 @@ in6_newaddrmsg(struct in6_ifaddr *ia, int cmd)
 	}
 }
 
+static bool
+in6_prefix_has_forwarding_owner(struct nd_prefix *pr,
+    struct in6_ifaddr *exclude)
+{
+	struct rm_priotracker in6_ifa_tracker;
+	struct in6_ifaddr *ia;
+	bool found;
+
+	if (pr == NULL)
+		return (false);
+
+	found = false;
+	IN6_IFADDR_RLOCK(&in6_ifa_tracker);
+	CK_STAILQ_FOREACH(ia, &V_in6_ifaddrhead, ia_link) {
+		if (ia == exclude || ia->ia6_ndpr != pr)
+			continue;
+		if ((ia->ia_ifa.ifa_ifp->if_flags & IFF_UP) == 0)
+			continue;
+		if (ia->ia_ifa.ifa_carp == NULL ||
+		    (carp_master_p != NULL && carp_master_p(&ia->ia_ifa))) {
+			found = true;
+			break;
+		}
+	}
+	IN6_IFADDR_RUNLOCK(&in6_ifa_tracker);
+	if (found)
+		return (true);
+
+	/*
+	 * A router-advertised prefix has an independent on-link reason; CARP
+	 * address ownership must not withdraw a prefix learned from that
+	 * router.  ndpr_advrtrs is protected by the ND6 lock.
+	 */
+	ND6_RLOCK();
+	found = !LIST_EMPTY(&pr->ndpr_advrtrs);
+	ND6_RUNLOCK();
+
+	return (found);
+}
+
+/*
+ * Synchronize IPv6 forwarding ownership with a CARP state transition.
+ * Configured BACKUP addresses stay present in the interface address lists,
+ * but only MASTER addresses contribute local/self and on-link routes.
+ */
+void
+in6_carp_ifa_route(struct in6_ifaddr *ia, bool add)
+{
+	struct nd_prefix *pr;
+	int error;
+
+	pr = ia->ia6_ndpr;
+	if (add) {
+		if (V_nd6_useloopback && (ia->ia_flags & IFA_RTSELF) == 0) {
+			error = ifa_add_loopback_route(&ia->ia_ifa,
+			    (struct sockaddr *)&ia->ia_addr);
+			if (error == 0 || error == EEXIST)
+				ia->ia_flags |= IFA_RTSELF;
+		}
+		(void)nd6_add_ifa_lle(ia);
+
+		/* Match the IPv4 CARP ownership notification contract. */
+		in6_newaddrmsg(ia, RTM_ADD);
+
+		if (pr != NULL && ia->ia_plen != 128) {
+			ND6_ONLINK_LOCK();
+			if ((pr->ndpr_stateflags & NDPRF_ONLINK) == 0) {
+				error = nd6_prefix_onlink(pr);
+				if (error != 0 && error != EEXIST)
+					nd6log((LOG_ERR,
+					    "%s: failed to make CARP prefix on-link "
+					    "(errno=%d)\n", __func__, error));
+			}
+			ND6_ONLINK_UNLOCK();
+		}
+		return;
+	}
+
+	if (V_nd6_useloopback) {
+		error = ifa_del_loopback_route(&ia->ia_ifa,
+		    (struct sockaddr *)&ia->ia_addr);
+		if (error == 0 || error == ENOENT || error == ESRCH)
+			ia->ia_flags &= ~IFA_RTSELF;
+	}
+	nd6_rem_ifa_lle(ia, 1);
+
+	/* Match IPv4: withdraw the address before its direct prefix route. */
+	in6_newaddrmsg(ia, RTM_DELETE);
+
+	if (pr != NULL && ia->ia_plen != 128 &&
+	    !in6_prefix_has_forwarding_owner(pr, ia)) {
+		ND6_ONLINK_LOCK();
+		if ((pr->ndpr_stateflags & NDPRF_ONLINK) != 0) {
+			error = nd6_prefix_offlink(pr);
+			if (error != 0 && error != EEXIST)
+				nd6log((LOG_ERR,
+				    "%s: failed to make CARP prefix off-link "
+				    "(errno=%d)\n", __func__, error));
+		}
+		ND6_ONLINK_UNLOCK();
+	}
+}
+
 int
 in6_mask2len(struct in6_addr *mask, u_char *lim0)
 {
@@ -1117,8 +1220,12 @@ in6_broadcast_ifa(struct ifnet *ifp, struct in6_aliasreq *ifra,
 	struct in6_multi *in6m_sol;
 	int error = 0;
 
-	/* Add local address to lltable, if necessary (ex. on p2p link). */
-	if ((error = nd6_add_ifa_lle(ia)) != 0) {
+	/*
+	 * Add a local address to lltable unless CARP owns its forwarding
+	 * lifecycle.  A CARP address becomes locally reachable only after the
+	 * VHID reaches MASTER; in6_carp_ifa_route() handles that transition.
+	 */
+	if (ifra->ifra_vhid == 0 && (error = nd6_add_ifa_lle(ia)) != 0) {
 		in6_purgeaddr(&ia->ia_ifa);
 		ifa_free(&ia->ia_ifa);
 		return (error);
@@ -1168,7 +1275,13 @@ in6_broadcast_ifa(struct ifnet *ifp, struct in6_aliasreq *ifra,
 		nd6_dad_start((struct ifaddr *)ia, delay);
 	}
 
-	in6_newaddrmsg(ia, RTM_ADD);
+	/*
+	 * For CARP addresses, RTM_NEWADDR is an ownership notification, not
+	 * merely a configuration notification.  carp(4) emits it when the
+	 * VHID actually owns the address.
+	 */
+	if (ifra->ifra_vhid == 0)
+		in6_newaddrmsg(ia, RTM_ADD);
 	ifa_free(&ia->ia_ifa);
 	return (error);
 }
@@ -1316,7 +1429,13 @@ in6_addifaddr(struct ifnet *ifp, struct in6_aliasreq *ifra, struct in6_ifaddr *i
 	 * later advertised RAs (when accept_rtadv is non 0), which is
 	 * an intended behavior.
 	 */
-	pr0.ndpr_raf_onlink = 1; /* should be configurable? */
+	/*
+	 * A CARP BACKUP address is configured but is not an on-link route
+	 * owner.  Preserve the prefix object, but defer installing its route
+	 * until carp(4) promotes the VHID to MASTER.
+	 */
+	pr0.ndpr_raf_onlink = !carp_attached ||
+	    (carp_master_p != NULL && carp_master_p(&ia->ia_ifa));
 	pr0.ndpr_raf_auto =
 	    ((ifra->ifra_flags & IN6_IFF_AUTOCONF) != 0);
 	pr0.ndpr_vltime = ifra->ifra_lifetime.ia6t_vltime;
@@ -1357,6 +1476,37 @@ in6_addifaddr(struct ifnet *ifp, struct in6_aliasreq *ifra, struct in6_ifaddr *i
 		ND6_WUNLOCK();
 	}
 
+	/*
+	 * A prefix can already exist but currently be off-link because its
+	 * first configured contributor was a CARP BACKUP address.  A newly
+	 * added ordinary address (or an already-MASTER CARP address) restores
+	 * native on-link ownership immediately.
+	 */
+	if (pr0.ndpr_raf_onlink &&
+	    (pr->ndpr_stateflags & NDPRF_ONLINK) == 0) {
+		ND6_ONLINK_LOCK();
+		error = nd6_prefix_onlink(pr);
+		ND6_ONLINK_UNLOCK();
+		if (error != 0 && error != EEXIST) {
+			if (carp_attached)
+				(*carp_detach_p)(&ia->ia_ifa, false);
+			nd6_prefix_rele(pr);
+			goto out;
+		}
+	}
+
+	/*
+	 * A manually configured CARP prefix remains eligible to become on-link
+	 * later even when the first address was added while BACKUP.  The
+	 * state flag below records current FIB ownership; raf_onlink records
+	 * the configured prefix property.
+	 */
+	if (carp_attached && !pr->ndpr_raf_onlink) {
+		ND6_WLOCK();
+		pr->ndpr_raf_onlink = 1;
+		ND6_WUNLOCK();
+	}
+
 	/* relate the address to the prefix */
 	if (ia->ia6_ndpr == NULL) {
 		ia->ia6_ndpr = pr;
@@ -1386,6 +1536,17 @@ in6_addifaddr(struct ifnet *ifp, struct in6_aliasreq *ifra, struct in6_ifaddr *i
 	pfxlist_onlink_check();
 
 aifaddr_out:
+	/*
+	 * If this address joined an already-MASTER VHID, carp_attach() does
+	 * not perform a state transition and therefore does not call
+	 * carp_addroute().  Complete ownership now, including /128 addresses
+	 * that do not have an ND6 prefix object.  Fresh VHIDs normally begin
+	 * as BACKUP and will be handled by the later MASTER transition.
+	 */
+	if (carp_attached && carp_master_p != NULL &&
+	    carp_master_p(&ia->ia_ifa))
+		in6_carp_ifa_route(ia, true);
+
 	/*
 	 * Try to clear the flag when a new IPv6 address is added
 	 * onto an IFDISABLED interface and it succeeds.
@@ -1419,9 +1580,11 @@ in6_purgeaddr(struct ifaddr *ifa)
 	struct ifnet *ifp = ifa->ifa_ifp;
 	struct in6_ifaddr *ia = (struct in6_ifaddr *) ifa;
 	struct in6_multi_mship *imm;
+	bool was_carp;
 	int error;
 
-	if (ifa->ifa_carp)
+	was_carp = (ifa->ifa_carp != NULL);
+	if (was_carp)
 		(*carp_detach_p)(ifa, false);
 
 	/*
@@ -1455,7 +1618,9 @@ in6_purgeaddr(struct ifaddr *ifa)
 		ia->ia_flags &= ~IFA_ROUTE;
 	}
 
-	in6_newaddrmsg(ia, RTM_DELETE);
+	/* carp_detach() already emitted the ownership withdrawal. */
+	if (!was_carp)
+		in6_newaddrmsg(ia, RTM_DELETE);
 	in6_unlink_ifa(ia, ifp);
 }
 
@@ -1480,6 +1645,13 @@ in6_purgeifaddr(struct in6_ifaddr *ia)
 	 */
 	pr = ia->ia6_ndpr;
 	in6_purgeaddr(&ia->ia_ifa);
+	if (pr != NULL && pr->ndpr_addrcnt > 0 &&
+	    (pr->ndpr_stateflags & NDPRF_ONLINK) != 0 &&
+	    !in6_prefix_has_forwarding_owner(pr, NULL)) {
+		ND6_ONLINK_LOCK();
+		(void)nd6_prefix_offlink(pr);
+		ND6_ONLINK_UNLOCK();
+	}
 	if (pr != NULL && pr->ndpr_addrcnt == 0) {
 		ND6_WLOCK();
 		nd6_prefix_unlink(pr, NULL);
@@ -1576,6 +1748,14 @@ in6_notify_ifa(struct ifnet *ifp, struct in6_ifaddr *ia,
 		if (error)
 			goto done;
 	}
+
+	/*
+	 * CARP owns all routing reachability for its addresses.  The generic
+	 * IPv6 address configuration path must not create p2p/self routes
+	 * before the VHID is MASTER.
+	 */
+	if (ifra->ifra_vhid > 0)
+		goto done;
 
 	/*
 	 * If a new destination address is specified, scrub the old one and

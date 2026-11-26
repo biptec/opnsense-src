@@ -79,7 +79,7 @@
 static struct nd_defrouter *defrtrlist_update(struct nd_defrouter *);
 static int prelist_update(struct nd_prefixctl *, struct nd_defrouter *,
     struct mbuf *, int);
-static int nd6_prefix_onlink(struct nd_prefix *);
+int nd6_prefix_onlink(struct nd_prefix *);
 static int in6_get_tmp_ifid(struct in6_aliasreq *);
 
 TAILQ_HEAD(nd6_drhead, nd_defrouter);
@@ -2072,7 +2072,7 @@ nd6_prefix_onlink_rtrequest(struct nd_prefix *pr, struct ifaddr *ifa)
 	return (error);
 }
 
-static int
+int
 nd6_prefix_onlink(struct nd_prefix *pr)
 {
 	struct epoch_tracker et;

@@ -52,6 +52,60 @@ wait_for_carp()
 	fi
 }
 
+wait_for_vhid_state()
+{
+	jail=$1
+	itf=$2
+	vhid=$3
+	state=$4
+	count=0
+
+	while ! jexec ${jail} ifconfig ${itf} |
+	    grep -Eq "(carp|vrrp): ${state} vhid ${vhid}"; do
+		count=$((count + 1))
+		if [ ${count} -ge 100 ]; then
+			jexec ${jail} ifconfig ${itf}
+			atf_fail "VHID ${vhid} on ${jail}/${itf} did not reach ${state}"
+		fi
+		sleep 0.1
+	done
+}
+
+assert_route_interface()
+{
+	jail=$1
+	family=$2
+	prefix=$3
+	itf=$4
+
+	if [ "${family}" = "inet6" ]; then
+		output=$(jexec ${jail} route -n get -inet6 -net ${prefix}) ||
+		    atf_fail "missing IPv6 route ${prefix} in ${jail}"
+	else
+		output=$(jexec ${jail} route -n get -net ${prefix}) ||
+		    atf_fail "missing IPv4 route ${prefix} in ${jail}"
+	fi
+	echo "${output}" | grep -Eq "^[[:space:]]*interface:[[:space:]]+${itf}$" ||
+	    atf_fail "route ${prefix} in ${jail} is not on ${itf}: ${output}"
+}
+
+assert_route_absent()
+{
+	jail=$1
+	family=$2
+	prefix=$3
+
+	if [ "${family}" = "inet6" ]; then
+		if jexec ${jail} route -n get -inet6 -net ${prefix} >/dev/null 2>&1; then
+			atf_fail "unexpected IPv6 route ${prefix} in ${jail}"
+		fi
+	else
+		if jexec ${jail} route -n get -net ${prefix} >/dev/null 2>&1; then
+			atf_fail "unexpected IPv4 route ${prefix} in ${jail}"
+		fi
+	fi
+}
+
 carp_init()
 {
 	if ! kldstat -q -m carp; then
@@ -575,6 +629,269 @@ switch_cleanup()
 	vnet_cleanup
 }
 
+atf_test_case "route_ownership_v4" "cleanup"
+route_ownership_v4_head()
+{
+	atf_set descr 'CARP BACKUP must not own the IPv4 connected prefix'
+	atf_set require.user root
+}
+
+route_ownership_v4_body()
+{
+	carp_init
+
+	epair=$(vnet_mkepair)
+	vnet_mkjail carp_route_v4_master ${epair}a
+	vnet_mkjail carp_route_v4_backup ${epair}b
+
+	jexec carp_route_v4_master ifconfig ${epair}a up
+	jexec carp_route_v4_master ifconfig ${epair}a vhid 1 advskew 0 \
+	    192.0.2.1/24
+	wait_for_vhid_state carp_route_v4_master ${epair}a 1 MASTER
+
+	jexec carp_route_v4_backup ifconfig ${epair}b up
+	jexec carp_route_v4_backup ifconfig ${epair}b vhid 1 advskew 100 \
+	    192.0.2.1/24
+	wait_for_vhid_state carp_route_v4_backup ${epair}b 1 BACKUP
+
+	assert_route_interface carp_route_v4_master inet 192.0.2.0/24 ${epair}a
+	assert_route_absent carp_route_v4_backup inet 192.0.2.0/24
+
+	jexec carp_route_v4_backup ifconfig ${epair}b down
+	jexec carp_route_v4_backup ifconfig ${epair}b up
+	wait_for_vhid_state carp_route_v4_backup ${epair}b 1 BACKUP
+
+	assert_route_interface carp_route_v4_master inet 192.0.2.0/24 ${epair}a
+	assert_route_absent carp_route_v4_backup inet 192.0.2.0/24
+}
+
+route_ownership_v4_cleanup()
+{
+	vnet_cleanup
+}
+
+atf_test_case "route_ownership_v6" "cleanup"
+route_ownership_v6_head()
+{
+	atf_set descr 'CARP MASTER alone must own the IPv6 on-link prefix'
+	atf_set require.user root
+}
+
+route_ownership_v6_body()
+{
+	carp_init
+
+	epair=$(vnet_mkepair)
+	vnet_mkjail carp_route_v6_master ${epair}a
+	vnet_mkjail carp_route_v6_backup ${epair}b
+
+	jexec carp_route_v6_master sysctl net.inet.carp.preempt=1
+	jexec carp_route_v6_backup sysctl net.inet.carp.preempt=1
+	jexec carp_route_v6_master ifconfig ${epair}a up
+	jexec carp_route_v6_master ifconfig ${epair}a inet6 add vhid 1 \
+	    advskew 0 2001:db8:10::1/64
+	wait_for_vhid_state carp_route_v6_master ${epair}a 1 MASTER
+
+	jexec carp_route_v6_backup ifconfig ${epair}b up
+	jexec carp_route_v6_backup ifconfig ${epair}b inet6 add vhid 1 \
+	    advskew 100 2001:db8:10::1/64
+	wait_for_vhid_state carp_route_v6_backup ${epair}b 1 BACKUP
+
+	assert_route_interface carp_route_v6_master inet6 2001:db8:10::/64 ${epair}a
+	assert_route_absent carp_route_v6_backup inet6 2001:db8:10::/64
+
+	jexec carp_route_v6_master ifconfig ${epair}a vhid 1 advskew 200
+	wait_for_vhid_state carp_route_v6_master ${epair}a 1 BACKUP
+	wait_for_vhid_state carp_route_v6_backup ${epair}b 1 MASTER
+
+	assert_route_absent carp_route_v6_master inet6 2001:db8:10::/64
+	assert_route_interface carp_route_v6_backup inet6 2001:db8:10::/64 ${epair}b
+}
+
+route_ownership_v6_cleanup()
+{
+	vnet_cleanup
+}
+
+atf_test_case "route_ownership_shared" "cleanup"
+route_ownership_shared_head()
+{
+	atf_set descr 'Shared CARP prefixes remain local while any VHID is MASTER'
+	atf_set require.user root
+}
+
+route_ownership_shared_body()
+{
+	carp_init
+
+	epair=$(vnet_mkepair)
+	vnet_mkjail carp_route_shared_a ${epair}a
+	vnet_mkjail carp_route_shared_b ${epair}b
+
+	jexec carp_route_shared_a sysctl net.inet.carp.preempt=1
+	jexec carp_route_shared_b sysctl net.inet.carp.preempt=1
+	jexec carp_route_shared_a ifconfig ${epair}a up
+	jexec carp_route_shared_b ifconfig ${epair}b up
+
+	jexec carp_route_shared_a ifconfig ${epair}a vhid 1 advskew 0 192.0.2.1/24
+	jexec carp_route_shared_a ifconfig ${epair}a vhid 2 advskew 100 192.0.2.2/24 alias
+	jexec carp_route_shared_b ifconfig ${epair}b vhid 1 advskew 100 192.0.2.1/24
+	jexec carp_route_shared_b ifconfig ${epair}b vhid 2 advskew 0 192.0.2.2/24 alias
+
+	jexec carp_route_shared_a ifconfig ${epair}a inet6 add vhid 1 \
+	    2001:db8:20::1/64
+	jexec carp_route_shared_a ifconfig ${epair}a inet6 add vhid 2 \
+	    2001:db8:20::2/64
+	jexec carp_route_shared_b ifconfig ${epair}b inet6 add vhid 1 \
+	    2001:db8:20::1/64
+	jexec carp_route_shared_b ifconfig ${epair}b inet6 add vhid 2 \
+	    2001:db8:20::2/64
+
+	wait_for_vhid_state carp_route_shared_a ${epair}a 1 MASTER
+	wait_for_vhid_state carp_route_shared_a ${epair}a 2 BACKUP
+	wait_for_vhid_state carp_route_shared_b ${epair}b 1 BACKUP
+	wait_for_vhid_state carp_route_shared_b ${epair}b 2 MASTER
+
+	assert_route_interface carp_route_shared_a inet 192.0.2.0/24 ${epair}a
+	assert_route_interface carp_route_shared_b inet 192.0.2.0/24 ${epair}b
+	assert_route_interface carp_route_shared_a inet6 2001:db8:20::/64 ${epair}a
+	assert_route_interface carp_route_shared_b inet6 2001:db8:20::/64 ${epair}b
+}
+
+route_ownership_shared_cleanup()
+{
+	vnet_cleanup
+}
+
+atf_test_case "route_ownership_mixed" "cleanup"
+route_ownership_mixed_head()
+{
+	atf_set descr 'Non-CARP address keeps a shared prefix local while CARP is BACKUP'
+	atf_set require.user root
+}
+
+route_ownership_mixed_body()
+{
+	carp_init
+
+	epair=$(vnet_mkepair)
+	vnet_mkjail carp_route_mixed_a ${epair}a
+	vnet_mkjail carp_route_mixed_b ${epair}b
+
+	jexec carp_route_mixed_a ifconfig ${epair}a 198.51.100.2/24 up
+	jexec carp_route_mixed_a ifconfig ${epair}a inet6 2001:db8:30::2/64 no_dad
+	jexec carp_route_mixed_b ifconfig ${epair}b up
+
+	jexec carp_route_mixed_b ifconfig ${epair}b vhid 1 advskew 0 \
+	    198.51.100.1/24
+	jexec carp_route_mixed_b ifconfig ${epair}b inet6 add vhid 1 \
+	    2001:db8:30::1/64
+	wait_for_vhid_state carp_route_mixed_b ${epair}b 1 MASTER
+
+	jexec carp_route_mixed_a ifconfig ${epair}a vhid 1 advskew 100 \
+	    198.51.100.1/24 alias
+	jexec carp_route_mixed_a ifconfig ${epair}a inet6 add vhid 1 \
+	    2001:db8:30::1/64
+	wait_for_vhid_state carp_route_mixed_a ${epair}a 1 BACKUP
+
+	assert_route_interface carp_route_mixed_a inet 198.51.100.0/24 ${epair}a
+	assert_route_interface carp_route_mixed_a inet6 2001:db8:30::/64 ${epair}a
+
+	# Removing the ordinary owner must not transfer either prefix route to
+	# the remaining CARP BACKUP identity.
+	jexec carp_route_mixed_a ifconfig ${epair}a inet 198.51.100.2 -alias
+	jexec carp_route_mixed_a ifconfig ${epair}a inet6 2001:db8:30::2 -alias
+	assert_route_absent carp_route_mixed_a inet 198.51.100.0/24
+	assert_route_absent carp_route_mixed_a inet6 2001:db8:30::/64
+}
+
+route_ownership_mixed_cleanup()
+{
+	vnet_cleanup
+}
+
+atf_test_case "route_ownership_v6_host" "cleanup"
+route_ownership_v6_host_head()
+{
+	atf_set descr 'CARP BACKUP must not own an IPv6 /128 local route'
+	atf_set require.user root
+}
+
+route_ownership_v6_host_body()
+{
+	carp_init
+
+	epair=$(vnet_mkepair)
+	vnet_mkjail carp_route_v6_host_master ${epair}a
+	vnet_mkjail carp_route_v6_host_backup ${epair}b
+
+	jexec carp_route_v6_host_master sysctl net.inet.carp.preempt=1
+	jexec carp_route_v6_host_backup sysctl net.inet.carp.preempt=1
+	jexec carp_route_v6_host_master ifconfig ${epair}a up
+	jexec carp_route_v6_host_backup ifconfig ${epair}b up
+
+	jexec carp_route_v6_host_master ifconfig ${epair}a inet6 add vhid 1 \
+	    advskew 0 2001:db8:40::1/128
+	jexec carp_route_v6_host_backup ifconfig ${epair}b inet6 add vhid 1 \
+	    advskew 100 2001:db8:40::1/128
+
+	wait_for_vhid_state carp_route_v6_host_master ${epair}a 1 MASTER
+	wait_for_vhid_state carp_route_v6_host_backup ${epair}b 1 BACKUP
+
+	assert_route_interface carp_route_v6_host_master inet6 2001:db8:40::1/128 lo0
+	assert_route_absent carp_route_v6_host_backup inet6 2001:db8:40::1/128
+
+	jexec carp_route_v6_host_master ifconfig ${epair}a vhid 1 advskew 200
+	wait_for_vhid_state carp_route_v6_host_master ${epair}a 1 BACKUP
+	wait_for_vhid_state carp_route_v6_host_backup ${epair}b 1 MASTER
+
+	assert_route_absent carp_route_v6_host_master inet6 2001:db8:40::1/128
+	assert_route_interface carp_route_v6_host_backup inet6 2001:db8:40::1/128 lo0
+}
+
+route_ownership_v6_host_cleanup()
+{
+	vnet_cleanup
+}
+
+atf_test_case "route_ownership_mixed_reverse" "cleanup"
+route_ownership_mixed_reverse_head()
+{
+	atf_set descr 'A non-CARP IPv6 address restores a prefix first created by CARP BACKUP'
+	atf_set require.user root
+}
+
+route_ownership_mixed_reverse_body()
+{
+	carp_init
+
+	epair=$(vnet_mkepair)
+	vnet_mkjail carp_route_mixed_reverse_a ${epair}a
+	vnet_mkjail carp_route_mixed_reverse_b ${epair}b
+
+	jexec carp_route_mixed_reverse_a ifconfig ${epair}a up
+	jexec carp_route_mixed_reverse_b ifconfig ${epair}b up
+
+	jexec carp_route_mixed_reverse_b ifconfig ${epair}b inet6 add vhid 1 \
+	    advskew 0 2001:db8:50::1/64
+	jexec carp_route_mixed_reverse_a ifconfig ${epair}a inet6 add vhid 1 \
+	    advskew 100 2001:db8:50::1/64
+
+	wait_for_vhid_state carp_route_mixed_reverse_b ${epair}b 1 MASTER
+	wait_for_vhid_state carp_route_mixed_reverse_a ${epair}a 1 BACKUP
+	assert_route_absent carp_route_mixed_reverse_a inet6 2001:db8:50::/64
+
+	jexec carp_route_mixed_reverse_a ifconfig ${epair}a inet6 \
+	    2001:db8:50::2/64 no_dad
+
+	assert_route_interface carp_route_mixed_reverse_a inet6 2001:db8:50::/64 ${epair}a
+}
+
+route_ownership_mixed_reverse_cleanup()
+{
+	vnet_cleanup
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case "basic_v4"
@@ -587,4 +904,10 @@ atf_init_test_cases()
 	atf_add_test_case "negative_demotion"
 	atf_add_test_case "nd6_ns_source_mac"
 	atf_add_test_case "switch"
+	atf_add_test_case "route_ownership_v4"
+	atf_add_test_case "route_ownership_v6"
+	atf_add_test_case "route_ownership_shared"
+	atf_add_test_case "route_ownership_mixed"
+	atf_add_test_case "route_ownership_v6_host"
+	atf_add_test_case "route_ownership_mixed_reverse"
 }
